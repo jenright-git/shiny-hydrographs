@@ -12,72 +12,77 @@ groundwater monitoring data.
 
 ---
 
-<!--
-Fill in the sections below with what you actually want. Anything left as a
-placeholder is an open question — Claude should ask rather than assume.
--->
-
 ## Data
 
-**Source:** <!-- Excel upload of esdat or EQuIS water level reports. Imported using the gRs::data_processor() function.
+**Source:** Excel upload of esdat or EQuIS water level reports. Imported using
+the `gRs::data_processor()` function.
 
-**Expected columns / schema:**
-<!--   Columns all expected to be detected as part of import function
-  "date"
-  "depth_unit",
-  "dry_indicator_yn",
-  "exact_elev",
-  "reference_elev",
-  "water_depth",
-  "water_level",
-  "water_level_depth" -->
+**Expected columns / schema:** all of the following are expected to be detected
+as part of the import function:
 
-**Units and conventions:**
-<!-- assumed to be m by default. Could be mbtoc (meters below top of casing), mAHD (m Australian Height Datum), ft (feet) or similar.  -->
+- `date`
+- `depth_unit`
+- `dry_indicator_yn`
+- `exact_elev`
+- `reference_elev`
+- `water_depth`
+- `water_level`
+- `water_level_depth`
 
-**Corrections required:**
-<!-- No corrections should be required.  All data should be correct from uploaded file.
-Some flags may be appropriate if source data doesnt match what is expected -->
+**Units and conventions:** assumed to be m by default. Could be mbtoc (meters
+below top of casing), mAHD (m Australian Height Datum), ft (feet) or similar.
+
+**Corrections required:** none. All data should be correct from the uploaded
+file. Some flags may be appropriate if source data doesn't match what is
+expected.
 
 ## Plots
 
-**Y axes:** <!-- water level (mbtoc) as default. Ability to change via drop down to water elevation etc.  A second series of LNAPL thickness. Likely as a second plot and patchwork the two one on top of the other -->
+**Y axes:** water level (mbtoc) as default, with a dropdown to change to water
+elevation etc. A second series for LNAPL thickness — likely a second plot,
+patchworked with the first, one on top of the other.
 
-**Series per location:** <!-- Same as above.  One showing water level and one showing LNAPL thickness.  Ability to change with dropdowns -->
+**Series per location:** same as above. One showing water level and one showing
+LNAPL thickness, changeable with dropdowns.
 
-**Multiple locations:** <!-- Default to one location per plot. Option to facet by location. -->
+**Multiple locations:** default to one location per plot. Option to facet by
+location.
 
-**Reference features:** <!-- precipitation overlay, tide data, remediation event
-markers, screen intervals, dry/NM flags -->
+**Reference features:** precipitation overlay, tide data, remediation event
+markers, screen intervals, dry/NM flags.
 
-**Static or interactive:** <!-- Ultimately want to save out to ggplot2 static image.  PNG or collated PDF document. -->
+**Static or interactive:** ultimately want to save out to a ggplot2 static
+image — PNG or a collated PDF document.
 
 ## Outputs
 
-<!-- PNG/PDF export. Multi-page PDF of all wells. 
-     If possible an excel export with raw data included.
-     Option for a PDF export with A4 landscape, 4 plots per page in a grid 2 x 2. Ordered by sys_loc_code / location_code -->
+- PNG/PDF export.
+- Multi-page PDF of all wells.
+- If possible, an Excel export with raw data included.
+- Option for a PDF export at A4 landscape, 4 plots per page in a 2 x 2 grid,
+  ordered by `sys_loc_code` / `location_code`.
 
 ## UI
 
-<!-- No set layout. Aim to keep as simple and user friendly as possible.
-     Seagreen colour theme for components
-     Helper text always welcome. -->
+No set layout. Aim to keep it as simple and user friendly as possible.
+
+- Seagreen colour theme for components.
+- Helper text always welcome.
 
 ## Constraints
 
-<!-- deployment target (posit.connect.cloud), large excel file upload required. -->
+- Deployment target: posit.connect.cloud.
+- Large Excel file upload required.
 
 ---
 
 ## Conventions
 
-<!-- Update these as the project takes shape. -->
-
 - Keep the app in a single `app.R` until it outgrows it; then split into
   `R/` modules with Shiny modules per plot type.
 - Prefer base R + tidyverse packages already common in EQuIS workflows.
-- Use my personal gRs and AEQuIS packages wherever possible.  These are installed locally and can be accessed here: 
-          - C:\Users\Enrightj\OneDrive - AECOM\Documents\My EQuIS Work\gRs
-          - C:\Users\Enrightj\OneDrive - AECOM\Documents\My EQuIS Work\AEQuIS
+- Use my personal gRs and AEQuIS packages wherever possible. These are
+  installed locally and can be accessed here:
+  - `C:\Users\Enrightj\OneDrive - AECOM\Documents\My EQuIS Work\gRs`
+  - `C:\Users\Enrightj\OneDrive - AECOM\Documents\My EQuIS Work\AEQuIS`
 - I like to use openair for any time averaging required.
