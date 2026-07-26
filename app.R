@@ -97,6 +97,104 @@ LNAPL_MEASURES <- list(
   lnapl_elevation = list(label = "LNAPL elevation", type = "elevation")
 )
 
+# Averaging periods, plus the round option that is only offered when the file
+# carries a round to group on. gRs maps esdat's monitoring_round and EQuIS's
+# task code - along with round / monitoring_event / event - onto `task_code`,
+# so the one option covers both exports.
+AVG_TIME_CHOICES <- c(
+  "None (as gauged)" = "none",
+  "Day" = "day",
+  "Week" = "week",
+  "Month" = "month",
+  "Quarter" = "quarter",
+  "Year" = "year"
+)
+
+AVG_ROUND_CHOICE <- c("Gauging round (task code)" = "round")
+
+# Passed straight through to openair for a time average, and applied by
+# apply_statistic() for a round average, so the two modes agree.
+AVG_STATISTICS <- c(
+  "Mean" = "mean",
+  "Median" = "median",
+  "Minimum" = "min",
+  "Maximum" = "max",
+  "Percentile" = "percentile"
+)
+
+#' Summarise a set of values the way openair::timeAverage() would
+#'
+#' Empty input returns NA rather than the NaN that mean() gives or the Inf that
+#' min() and max() give, neither of which ggplot2 or openair reads as missing.
+apply_statistic <- function(x, statistic = "mean", percentile = 95) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) {
+    return(NA_real_)
+  }
+  switch(
+    statistic,
+    mean = mean(x),
+    median = stats::median(x),
+    min = min(x),
+    max = max(x),
+    percentile = unname(stats::quantile(x, probs = percentile / 100)),
+    mean(x)
+  )
+}
+
+#' Middle of a set of timestamps, kept as a timestamp
+#'
+#' stats::median() on POSIXct is not guaranteed across the classes gRs can
+#' return, so the arithmetic is done on seconds and converted back.
+median_time <- function(x) {
+  tz <- attr(x, "tzone") %||% ""
+  x <- x[!is.na(x)]
+  if (length(x) == 0) {
+    return(as.POSIXct(NA_real_, origin = "1970-01-01", tz = tz))
+  }
+  as.POSIXct(stats::median(as.numeric(x)), origin = "1970-01-01", tz = tz)
+}
+
+#' Does this export carry a round worth grouping on?
+has_rounds <- function(df) {
+  "task_code" %in% names(df) &&
+    any(!is.na(df$task_code) & nzchar(df$task_code))
+}
+
+#' Collapse each location to one record per gauging round
+#'
+#' Rounds are grouped by their own label rather than by a date window: on a
+#' real site they overlap, because a re-gauge or a make-up visit is logged
+#' against the round it belongs to weeks after that round opened. The round is
+#' then plotted at the median date of the records it holds for that well, which
+#' for the usual one-gauging-per-round is simply the gauging date.
+#'
+#' Records carrying no round cannot take part and are dropped - the import
+#' checks report how many there are.
+average_by_round <- function(df, value_cols, statistic, percentile) {
+  df <- df[!is.na(df$task_code) & nzchar(df$task_code), , drop = FALSE]
+  if (nrow(df) == 0) {
+    return(df[0, , drop = FALSE])
+  }
+
+  out <- df %>%
+    dplyr::summarise(
+      date = median_time(.data$date),
+      dplyr::across(
+        dplyr::all_of(value_cols),
+        \(x) apply_statistic(x, statistic, percentile)
+      ),
+      .by = c("location_code", "task_code")
+    ) %>%
+    dplyr::arrange(.data$location_code, .data$date)
+
+  # Averaging collapses the flag columns, so they are re-added as absent.
+  out$dry_indicator_yn <- NA_character_
+  out$top_screen_depth <- NA_real_
+  out$bottom_screen_depth <- NA_real_
+  out
+}
+
 measure_label <- function(col) {
   meta <- c(WATER_MEASURES, LNAPL_MEASURES)[[col]]
   if (is.null(meta)) col else meta$label
@@ -325,6 +423,43 @@ import_flags <- function(df) {
     }
   )
 
+  n_rounds <- if ("task_code" %in% names(df)) {
+    length(unique(df$task_code[!is.na(df$task_code) & nzchar(df$task_code)]))
+  } else {
+    0
+  }
+  n_no_round <- if ("task_code" %in% names(df)) {
+    sum(is.na(df$task_code) | !nzchar(df$task_code))
+  } else {
+    nrow(df)
+  }
+  flags <- add(
+    flags,
+    if (n_rounds == 0 || n_no_round > 0) "Info" else "OK",
+    "Gauging rounds",
+    if (n_rounds == 0) {
+      paste0(
+        "No round recorded in ",
+        "task_code",
+        ". Averaging by gauging round is unavailable."
+      )
+    } else {
+      paste0(
+        n_rounds,
+        " round(s) recorded in task_code.",
+        if (n_no_round > 0) {
+          paste0(
+            " ",
+            n_no_round,
+            " record(s) carry none and are dropped when averaging by round."
+          )
+        } else {
+          ""
+        }
+      )
+    }
+  )
+
   n_no_ref <- sum(is.na(df$reference_elev))
   if (n_no_ref > 0) {
     flags <- add(
@@ -390,7 +525,7 @@ theme_hydro <- function(base_size = 10) {
       plot.caption = element_text(
         colour = INK$muted,
         size = rel(0.8),
-        hjust = 0
+        hjust = 1
       ),
       plot.title.position = "plot",
       plot.caption.position = "plot"
@@ -1002,9 +1137,25 @@ ui <- page_sidebar(
             "select_none",
             "Clear",
             class = "btn-sm btn-outline-secondary"
+          ),
+          conditionalPanel(
+            condition = "input.pause_refresh",
+            actionButton(
+              "apply_locations",
+              "Apply",
+              class = "btn-sm btn-primary"
+            )
           )
         ),
-        checkboxInput("facet", "One panel per location", FALSE),
+        checkboxInput("pause_refresh", "Pause refresh while selecting", FALSE),
+        help_text(
+          "Tick this before building up a selection: the plot holds its ",
+          "current locations while you add or remove as many as you like, and ",
+          "redraws once when you press Apply. Every other control still ",
+          "refreshes immediately."
+        ),
+        uiOutput("pending_note"),
+        checkboxInput("facet", "One panel per location", TRUE),
         numericInput(
           "ncol",
           "Panel columns",
@@ -1015,11 +1166,12 @@ ui <- page_sidebar(
         ),
         checkboxInput("free_y", "Independent y-axis per panel", FALSE),
         help_text(
-          "Overlaid locations are capped at ",
+          "One panel per location is the default. Untick it to overlay the ",
+          "locations on a single panel - that is capped at ",
           MAX_OVERLAY_SERIES,
-          " so every series keeps a distinguishable colour. Above that, ",
-          "switch to one panel per location. A shared y-axis keeps wells ",
-          "comparable; an independent one suits wells at different elevations."
+          " so every series keeps a distinguishable colour. A shared y-axis ",
+          "keeps wells comparable; an independent one suits wells at ",
+          "different elevations."
         ),
         help_text(
           "With the LNAPL panel on, each location becomes a water-over-LNAPL ",
@@ -1031,22 +1183,39 @@ ui <- page_sidebar(
         "Time",
         icon = bsicons::bs_icon("calendar3"),
         dateRangeInput("date_range", "Date range", start = NULL, end = NULL),
-        selectInput(
-          "avg_time",
-          "Time average",
-          choices = c(
-            "None (as gauged)" = "none",
-            "Day" = "day",
-            "Week" = "week",
-            "Month" = "month",
-            "Quarter" = "quarter",
-            "Year" = "year"
-          )
-        ),
+        selectInput("avg_time", "Average by", choices = AVG_TIME_CHOICES),
         help_text(
-          "Averaged with ",
+          "Periods are averaged with ",
           tags$code("openair::timeAverage()"),
-          ". Dry flags are hidden when averaging."
+          ", each location independently. 'Gauging round' groups on ",
+          tags$code("task_code"),
+          " instead and appears once the file carries one. Dry flags and ",
+          "screen bands are hidden whenever anything is averaged."
+        ),
+        conditionalPanel(
+          condition = "input.avg_time != 'none'",
+          selectInput(
+            "avg_statistic",
+            "Statistic",
+            choices = AVG_STATISTICS,
+            selected = "mean"
+          ),
+          conditionalPanel(
+            condition = "input.avg_statistic == 'percentile'",
+            numericInput(
+              "avg_percentile",
+              "Percentile",
+              value = 95,
+              min = 0,
+              max = 100,
+              step = 5
+            )
+          ),
+          help_text(
+            "Applied to the measure as plotted, not to the water level in the ",
+            "ground - on a depth axis the maximum is the deepest reading, so ",
+            "it is the lowest water level of the period."
+          )
         ),
         selectInput(
           "date_break",
@@ -1268,6 +1437,19 @@ server <- function(input, output, session) {
       }
     )
 
+    # Only offered when there is something to group on - an export with no
+    # round recorded would otherwise give an option that returns nothing.
+    updateSelectInput(
+      session,
+      "avg_time",
+      choices = if (has_rounds(df)) {
+        c(AVG_TIME_CHOICES[1], AVG_ROUND_CHOICE, AVG_TIME_CHOICES[-1])
+      } else {
+        AVG_TIME_CHOICES
+      },
+      selected = "none"
+    )
+
     locs <- sort(unique(df$location_code))
     updateSelectizeInput(
       session,
@@ -1337,15 +1519,67 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "locations", selected = character(0))
   })
 
+  # --- location selection --------------------------------------------------
+
+  # Redrawing on every keystroke of a selectize is fine for a handful of wells
+  # and painful for thirty, so the plot reads a committed copy of the selection
+  # rather than the widget. Unpaused the copy tracks the widget; paused it only
+  # moves on Apply, which is also what unpausing does.
+  locations_active <- reactiveVal(character(0))
+
+  observeEvent(list(input$locations, input$pause_refresh), {
+    if (isTRUE(input$pause_refresh)) {
+      return()
+    }
+    locations_active(input$locations %||% character(0))
+  })
+
+  observeEvent(input$apply_locations, {
+    locations_active(input$locations %||% character(0))
+  })
+
+  # Paused, the sidebar is the only thing that shows a pending edit - the plot
+  # deliberately does not.
+  output$pending_note <- renderUI({
+    req(isTRUE(input$pause_refresh))
+    pending <- input$locations %||% character(0)
+    active <- locations_active()
+    added <- setdiff(pending, active)
+    removed <- setdiff(active, pending)
+
+    if (length(added) == 0 && length(removed) == 0) {
+      return(help_text(sprintf(
+        "Paused. Plot is showing all %d selected location%s.",
+        length(active),
+        if (length(active) == 1) "" else "s"
+      )))
+    }
+    div(
+      class = "form-text text-primary fw-semibold",
+      style = "margin-top:-0.4rem;margin-bottom:0.6rem;",
+      sprintf(
+        "%s not plotted yet - press Apply.",
+        paste(
+          c(
+            if (length(added) > 0) paste(length(added), "added"),
+            if (length(removed) > 0) paste(length(removed), "removed")
+          ),
+          collapse = ", "
+        )
+      )
+    )
+  })
+
   # --- data pipeline -------------------------------------------------------
 
   filtered <- reactive({
     df <- imported()
-    req(df, input$locations, input$measure)
+    locs <- locations_active()
+    req(df, length(locs) > 0, input$measure)
 
     df <- df %>%
       dplyr::filter(
-        .data$location_code %in% input$locations,
+        .data$location_code %in% locs,
         !is.na(.data$date)
       )
 
@@ -1359,9 +1593,17 @@ server <- function(input, output, session) {
     df
   })
 
+  # A percentile is only read when it is the chosen statistic, and its box
+  # reads back NA while it is being retyped.
+  avg_percentile <- reactive({
+    p <- input$avg_percentile
+    if (is.null(p) || length(p) != 1 || is.na(p)) 95 else max(0, min(100, p))
+  })
+
   averaged <- reactive({
     df <- filtered()
-    if (identical(input$avg_time, "none") || nrow(df) == 0) {
+    avg <- input$avg_time %||% "none"
+    if (identical(avg, "none") || nrow(df) == 0) {
       return(df)
     }
 
@@ -1369,14 +1611,56 @@ server <- function(input, output, session) {
       c(names(WATER_MEASURES), names(LNAPL_MEASURES)),
       names(df)
     )
-    slim <- as.data.frame(df[, c("date", "location_code", value_cols)])
+    statistic <- input$avg_statistic %||% "mean"
+    percentile <- avg_percentile()
+
+    if (identical(avg, "round")) {
+      out <- average_by_round(df, value_cols, statistic, percentile)
+      if (nrow(out) == 0) {
+        showNotification(
+          paste0(
+            "No round is recorded against the selected records - showing ",
+            "gauged values."
+          ),
+          type = "warning"
+        )
+        return(df)
+      }
+      return(out)
+    }
+
+    # `type` is what keeps the wells apart - openair splits on it and averages
+    # each group against its own series. Without it every location is collapsed
+    # into one mean per period, which is never what a hydrograph wants.
+    #
+    # It does not, however, cover a timestamp repeated *within* one location:
+    # openair cannot infer a sampling interval from a zero-length gap and
+    # aborts the whole call, losing every other well with it. Re-gauged wells
+    # and split field sheets both produce those repeats - the import checks
+    # already flag them - so exact duplicates are collapsed here first, with
+    # the same statistic openair is about to apply to the period.
+    slim <- df %>%
+      dplyr::select("date", "location_code", dplyr::all_of(value_cols)) %>%
+      dplyr::summarise(
+        dplyr::across(
+          dplyr::all_of(value_cols),
+          \(x) apply_statistic(x, statistic, percentile)
+        ),
+        .by = c("location_code", "date")
+      ) %>%
+      as.data.frame()
 
     out <- tryCatch(
       openair::timeAverage(
         slim,
-        avg.time = input$avg_time,
+        avg.time = avg,
         type = "location_code",
-        statistic = "mean"
+        statistic = statistic,
+        percentile = if (identical(statistic, "percentile")) {
+          percentile
+        } else {
+          NA
+        }
       ),
       error = function(e) NULL
     )
@@ -1389,7 +1673,30 @@ server <- function(input, output, session) {
     }
 
     out <- tibble::as_tibble(out)
+    # openair returns the `type` column as a factor of the groups it split on.
     out$location_code <- as.character(out$location_code)
+
+    # Where a well is gauged less often than the averaging period - quarterly
+    # data averaged by month, say - openair pads the series with empty rows
+    # rather than averaging it. They plot as nothing but would otherwise fill
+    # the data tab and the Excel export.
+    present <- intersect(value_cols, names(out))
+    if (length(present) > 0) {
+      out <- out[
+        rowSums(!is.na(out[, present, drop = FALSE])) > 0,
+        ,
+        drop = FALSE
+      ]
+    }
+
+    if (nrow(out) == 0) {
+      showNotification(
+        "Time averaging returned no values - showing gauged values.",
+        type = "warning"
+      )
+      return(df)
+    }
+
     # Averaging collapses the flag columns, so they are re-added as absent.
     out$dry_indicator_yn <- NA_character_
     out$top_screen_depth <- NA_real_
@@ -1412,9 +1719,10 @@ server <- function(input, output, session) {
       title = input$title %||% "",
       subtitle = input$subtitle %||% "",
       caption = input$caption %||% "",
-      show_dry = isTRUE(input$show_dry) && identical(input$avg_time, "none"),
+      show_dry = isTRUE(input$show_dry) &&
+        identical(input$avg_time %||% "none", "none"),
       show_screen = isTRUE(input$show_screen) &&
-        identical(input$avg_time, "none")
+        identical(input$avg_time %||% "none", "none")
     )
   })
 
@@ -1479,7 +1787,7 @@ server <- function(input, output, session) {
   # --- exports -------------------------------------------------------------
 
   export_stem <- reactive({
-    locs <- input$locations %||% character(0)
+    locs <- locations_active()
     tag <- if (length(locs) == 1) locs else paste0(length(locs), "-locations")
     paste0(
       "hydrograph_",
@@ -1552,12 +1860,12 @@ server <- function(input, output, session) {
   per_page <- reactive(max(1, as.integer(num_or(input$per_page, 4))))
 
   appendix_pages <- reactive({
-    paginate(input$locations %||% character(0), per_page())
+    paginate(locations_active(), per_page())
   })
 
   output$appendix_note <- renderUI({
     pages <- appendix_pages()
-    n_loc <- length(input$locations %||% character(0))
+    n_loc <- length(locations_active())
     if (n_loc == 0) {
       return(help_text("Select locations to build an appendix."))
     }
