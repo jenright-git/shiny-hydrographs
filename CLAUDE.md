@@ -17,6 +17,8 @@ groundwater monitoring data.
 **Source:** Excel upload of esdat or EQuIS water level reports. Imported using
 the `gRs::data_processor()` function.
 
+**Background:** Use the web or this resource for background on water levels and LNAPL https://lnapl-3.itrcweb.org/3-key-lnapl-concepts/?print=pdf 
+
 **Expected columns / schema:** all of the following are expected to be detected
 as part of the import function:
 
@@ -54,6 +56,10 @@ markers, screen intervals, dry/NM flags.
 **Static or interactive:** ultimately want to save out to a ggplot2 static
 image — PNG or a collated PDF document.
 
+**Colours:** Use scientific colour schemes as default.  The ability to change colours via an interactive colour wheel is ideal.
+
+**Date Ranges:** Default to ggplot2 defaults.  Add UI to allow user to change date ranges, breaks, labels etc.
+
 ## Outputs
 
 - PNG/PDF export.
@@ -86,3 +92,5 @@ No set layout. Aim to keep it as simple and user friendly as possible.
   - `C:\Users\Enrightj\OneDrive - AECOM\Documents\My EQuIS Work\gRs`
   - `C:\Users\Enrightj\OneDrive - AECOM\Documents\My EQuIS Work\AEQuIS`
 - I like to use openair for any time averaging required.
+
+- When testing, mainly test on the esdat example report due to it being a longer timeseries and more complete dataset.
