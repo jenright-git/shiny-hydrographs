@@ -316,9 +316,12 @@ build_x_scale <- function(date_break, date_label, limits) {
 #'
 #' @param colour_by NULL for a single-colour panel, or "location_code" to map
 #'   locations onto the fixed categorical slots.
+#' @param y_limits optional c(min, max) the panel must span. Used to hold
+#'   separate per-location plots on a common y-axis, where a single faceted
+#'   plot would have done it for us.
 build_panel <- function(
   df, measure, unit_label, colour_by, palette, reverse_y, single_colour,
-  facet, ncol, free_y, x_scale, y_from_zero = FALSE
+  facet, ncol, free_y, x_scale, y_from_zero = FALSE, y_limits = NULL
 ) {
   df <- df[!is.na(df[[measure]]) & !is.na(df$date), , drop = FALSE]
 
@@ -358,6 +361,10 @@ build_panel <- function(
     ) +
     theme_hydro()
 
+  if (!is.null(y_limits) && all(is.finite(y_limits))) {
+    p <- p + expand_limits(y = y_limits)
+  }
+
   if (facet) {
     p <- p + facet_wrap(
       vars(.data$location_code),
@@ -393,16 +400,6 @@ build_hydrograph <- function(df, opts) {
     )
   }
 
-  # Two faceted grids stacked by patchwork do not interleave: well 1's LNAPL
-  # panel lands a whole grid below its water panel, which reads as though the
-  # rows correspond when they do not. The two options are mutually exclusive
-  # until this is rebuilt as a single location x measure grid.
-  if (opts$facet && !identical(opts$lnapl_measure, "none")) {
-    stop(
-      "The LNAPL panel cannot be combined with one panel per location - the ",
-      "two grids would not line up. Turn one of them off."
-    )
-  }
   palette <- stats::setNames(SERIES_COLOURS[seq_along(locations)], locations)
   colour_by <- if (overlay_colours) "location_code" else NULL
 
@@ -410,6 +407,16 @@ build_hydrograph <- function(df, opts) {
   x_scale <- build_x_scale(opts$date_break, opts$date_label, x_limits)
 
   reverse_water <- opts$reverse_y && measure_type(opts$measure) == "depth"
+
+  # Stacking two faceted grids would not interleave - well 1's LNAPL panel
+  # would land a whole grid below its water panel. Instead each location gets
+  # its own water-over-LNAPL pair, and the pairs are laid out as the grid.
+  if (opts$facet && !identical(opts$lnapl_measure, "none")) {
+    return(annotate_plot(
+      build_location_grid(df, opts, x_scale, palette, locations),
+      opts, single_panel = FALSE
+    ))
+  }
 
   p_water <- build_panel(
     df, opts$measure, opts$unit_label, colour_by, palette,
@@ -458,6 +465,76 @@ build_hydrograph <- function(df, opts) {
   annotate_plot(combined, opts, single_panel = FALSE)
 }
 
+#' Lay out one water-over-LNAPL pair per location
+#'
+#' patchwork nests, so each location is assembled as its own two-panel stack
+#' and the stacks are then wrapped into the requested number of columns. Every
+#' cell therefore carries its own LNAPL panel directly under its water panel.
+#' The water panel keeps a one-location facet purely to draw the strip that
+#' labels the pair.
+build_location_grid <- function(df, opts, x_scale, palette, locations) {
+  finite_range <- function(x) {
+    x <- x[is.finite(x)]
+    if (length(x) == 0) NULL else range(x)
+  }
+  water_range <- finite_range(df[[opts$measure]])
+  lnapl_range <- finite_range(df[[opts$lnapl_measure]])
+
+  # A screen band drawn past the data would stretch that one cell's axis, so
+  # the shared range has to allow for the bands too or the cells stop matching.
+  screens <- screen_bands(df, opts)
+  if (!is.null(screens)) {
+    water_range <- finite_range(c(water_range, screens$top, screens$bottom))
+  }
+
+  reverse_water <- opts$reverse_y && measure_type(opts$measure) == "depth"
+  reverse_lnapl <- opts$reverse_y && measure_type(opts$lnapl_measure) == "depth"
+
+  stacks <- lapply(locations, function(loc) {
+    df_loc <- df[df$location_code == loc, , drop = FALSE]
+    has_water <- any(!is.na(df_loc[[opts$measure]]))
+    has_lnapl <- any(!is.na(df_loc[[opts$lnapl_measure]]))
+
+    # Nothing to draw either way - dropped, exactly as a plain facet would.
+    if (!has_water && !has_lnapl) return(NULL)
+
+    p_water <- build_panel(
+      df_loc, opts$measure, opts$unit_label, NULL, palette,
+      reverse_y = reverse_water,
+      single_colour = WATER_COLOUR,
+      # A one-location facet is only what draws the strip carrying the well
+      # name, and a facet needs a row to work from - so on the rare well with
+      # no water values the strip moves to the LNAPL panel below.
+      facet = has_water, ncol = 1, free_y = FALSE, x_scale = x_scale,
+      # Separate plots have no shared scale of their own, so a common y-range
+      # has to be handed to each one.
+      y_limits = if (opts$free_y && has_water) NULL else water_range
+    )
+    p_water <- add_dry_ticks(p_water, df_loc, opts)
+    p_water <- add_screen_band(p_water, df_loc, opts, loc)
+    p_water <- p_water +
+      theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+    lnapl_df <- df_loc[!is.na(df_loc[[opts$lnapl_measure]]), , drop = FALSE]
+
+    # A well with no LNAPL still gets an (empty) panel, so every cell is the
+    # same shape and the wells stay comparable.
+    p_lnapl <- build_panel(
+      lnapl_df, opts$lnapl_measure, opts$lnapl_unit_label, NULL, palette,
+      reverse_y = reverse_lnapl,
+      single_colour = LNAPL_COLOUR,
+      facet = !has_water, ncol = 1, free_y = FALSE, x_scale = x_scale,
+      y_from_zero = measure_type(opts$lnapl_measure) == "thickness",
+      y_limits = if (opts$free_y && has_lnapl) NULL else lnapl_range
+    )
+
+    p_water / p_lnapl + plot_layout(heights = c(2, 1))
+  })
+
+  stacks <- Filter(Negate(is.null), stacks)
+  wrap_plots(stacks, ncol = min(opts$ncol, length(stacks)))
+}
+
 #' Mark dry gaugings as ticks along the x-axis
 add_dry_ticks <- function(p, df, opts) {
   if (!opts$show_dry) return(p)
@@ -473,17 +550,16 @@ add_dry_ticks <- function(p, df, opts) {
     )
 }
 
-#' Shade the screened interval behind a depth-axis hydrograph
+#' One screened interval per location, or NULL if none can be drawn
 #'
-#' Only drawn for depth measures, because a screen depth and an elevation are
-#' not on the same scale. In overlay mode it needs a single location, since one
-#' band cannot describe several wells.
-add_screen_band <- function(p, df, opts, locations) {
-  if (!opts$show_screen) return(p)
-  if (measure_type(opts$measure) != "depth") return(p)
-  if (!opts$facet && length(locations) > 1) return(p)
+#' Only meaningful for depth measures, because a screen depth and an elevation
+#' are not on the same scale. A well gauged with more than one recorded screen
+#' is reduced to its median, as a single band is all a hydrograph can carry.
+screen_bands <- function(df, opts) {
+  if (!opts$show_screen) return(NULL)
+  if (measure_type(opts$measure) != "depth") return(NULL)
   if (!all(c("top_screen_depth", "bottom_screen_depth") %in% names(df))) {
-    return(p)
+    return(NULL)
   }
 
   screens <- df %>%
@@ -495,7 +571,17 @@ add_screen_band <- function(p, df, opts, locations) {
     ) %>%
     dplyr::filter(!is.na(.data$top), !is.na(.data$bottom))
 
-  if (nrow(screens) == 0) return(p)
+  if (nrow(screens) == 0) NULL else screens
+}
+
+#' Shade the screened interval behind a depth-axis hydrograph
+#'
+#' In overlay mode it needs a single location, since one band cannot describe
+#' several wells.
+add_screen_band <- function(p, df, opts, locations) {
+  if (!opts$facet && length(locations) > 1) return(p)
+  screens <- screen_bands(df, opts)
+  if (is.null(screens)) return(p)
 
   # Drawn first so the data sits on top of the band.
   p$layers <- c(
@@ -571,18 +657,22 @@ ui <- page_sidebar(
           "Edit if the site uses a different datum - the export records the ",
           "unit but not the datum."
         ),
-        checkboxInput("reverse_y", "Reverse y-axis for depth measures", FALSE),
+        checkboxInput("reverse_y", "Reverse y-axis for depth measures", TRUE),
         help_text(
-          "Off: the axis increases upward, so a rising depth-to-water plots ",
-          "as a rising line. On: depths invert, so shallower water sits ",
-          "higher and the trace reads like an elevation plot."
+          "On by default whenever a depth measure is chosen: the axis ",
+          "inverts, so shallower water sits higher and the trace reads like ",
+          "an elevation plot. Off: depth increases upward, so a falling ",
+          "water level plots as a rising line."
         ),
         selectInput(
           "lnapl_measure", "LNAPL panel",
           choices = c("None" = "none")
         ),
         textInput("lnapl_unit_label", "LNAPL unit"),
-        help_text("Added as a shorter panel below, sharing the x-axis.")
+        help_text(
+          "Added as a shorter panel below, sharing the x-axis. Defaults to ",
+          "thickness when the file carries it."
+        )
       ),
 
       accordion_panel(
@@ -606,8 +696,8 @@ ui <- page_sidebar(
           "comparable; an independent one suits wells at different elevations."
         ),
         help_text(
-          "One panel per location and the LNAPL panel cannot be used ",
-          "together - selecting one clears the other."
+          "With the LNAPL panel on, each location becomes a water-over-LNAPL ",
+          "pair. Allow roughly twice the figure height in that case."
         )
       ),
 
@@ -691,7 +781,15 @@ ui <- page_sidebar(
       "Data", icon = bsicons::bs_icon("table"),
       help_text(
         "The records behind the current plot, after location and date ",
-        "filtering and any time averaging."
+        "filtering and any time averaging. The export carries these records ",
+        "on one sheet and the import checks on another."
+      ),
+      div(
+        class = "mb-2",
+        downloadButton(
+          "download_xlsx", "Download Excel",
+          icon = icon("file-excel"), class = "btn-primary btn-sm"
+        )
       ),
       DT::DTOutput("data_table")
     )
@@ -754,7 +852,15 @@ server <- function(input, output, session) {
         c("None" = "none"),
         stats::setNames(lnapl_available, vapply(lnapl_available, measure_label, ""))
       ),
-      selected = "none"
+      # Thickness is the measure asked for on almost every LNAPL site, so it
+      # is chosen whenever the file supplies it.
+      selected = if ("lnapl_thickness" %in% lnapl_available) {
+        "lnapl_thickness"
+      } else if (length(lnapl_available) > 0) {
+        lnapl_available[[1]]
+      } else {
+        "none"
+      }
     )
 
     locs <- sort(unique(df$location_code))
@@ -778,6 +884,11 @@ server <- function(input, output, session) {
     updateTextInput(session, "unit_label", value = default_unit_label(
       measure_type(input$measure), df$depth_unit[[1]]
     ))
+    # A depth axis reads the wrong way up untouched, so reversing it is the
+    # default whenever a depth measure is picked.
+    if (measure_type(input$measure) == "depth") {
+      updateCheckboxInput(session, "reverse_y", value = TRUE)
+    }
   })
 
   observeEvent(input$lnapl_measure, {
@@ -787,29 +898,6 @@ server <- function(input, output, session) {
     updateTextInput(session, "lnapl_unit_label", value = default_unit_label(
       measure_type(input$lnapl_measure), df$depth_unit[[1]]
     ))
-  })
-
-  # Faceting and the LNAPL panel cannot be drawn together (see
-  # build_hydrograph). Clearing the other one keeps a figure on screen instead
-  # of trading it for an error message.
-  observeEvent(input$facet, {
-    if (isTRUE(input$facet) && !identical(input$lnapl_measure, "none")) {
-      updateSelectInput(session, "lnapl_measure", selected = "none")
-      showNotification(
-        "LNAPL panel cleared - it cannot be drawn alongside one panel per location.",
-        type = "warning"
-      )
-    }
-  })
-
-  observeEvent(input$lnapl_measure, {
-    if (!identical(input$lnapl_measure, "none") && isTRUE(input$facet)) {
-      updateCheckboxInput(session, "facet", value = FALSE)
-      showNotification(
-        "Switched back to overlaid locations so the LNAPL panel can be drawn.",
-        type = "warning"
-      )
-    }
   })
 
   observeEvent(input$select_all, {
@@ -1021,27 +1109,51 @@ server <- function(input, output, session) {
     )
   })
 
-  output$data_table <- DT::renderDT({
+  # Shared by the table and the Excel export, so what is downloaded is exactly
+  # what is on screen.
+  table_data <- reactive({
     df <- averaged()
-    req(nrow(df) > 0)
     keep <- intersect(
       c("location_code", "date", "depth_unit", "dry_indicator_yn",
         names(WATER_MEASURES), names(LNAPL_MEASURES), "reference_elev",
         "task_code", "remark"),
       names(df)
     )
+    df[, keep, drop = FALSE]
+  })
+
+  output$data_table <- DT::renderDT({
+    df <- table_data()
+    req(nrow(df) > 0)
     DT::datatable(
-      df[, keep, drop = FALSE],
+      df,
       rownames = FALSE,
       filter = "top",
       options = list(pageLength = 25, scrollX = TRUE)
     ) %>%
       DT::formatRound(
-        columns = intersect(keep, c(names(WATER_MEASURES), names(LNAPL_MEASURES),
-                                    "reference_elev")),
+        columns = intersect(
+          names(df),
+          c(names(WATER_MEASURES), names(LNAPL_MEASURES), "reference_elev")
+        ),
         digits = 3
       )
   })
+
+  output$download_xlsx <- downloadHandler(
+    filename = function() paste0(export_stem(), "_data.xlsx"),
+    content = function(file) {
+      df <- table_data()
+      req(nrow(df) > 0)
+      writexl::write_xlsx(
+        list(
+          "Plot data" = as.data.frame(df),
+          "Import checks" = as.data.frame(import_flags(imported()))
+        ),
+        path = file
+      )
+    }
+  )
 }
 
 shinyApp(ui, server)
