@@ -3,6 +3,7 @@ library(bslib)
 library(ggplot2)
 library(patchwork)
 library(dplyr)
+library(colourpicker)
 library(gRs)
 
 # Large gauging exports are the norm; posit.connect.cloud allows this to be set.
@@ -157,8 +158,7 @@ median_time <- function(x) {
 
 #' Does this export carry a round worth grouping on?
 has_rounds <- function(df) {
-  "task_code" %in% names(df) &&
-    any(!is.na(df$task_code) & nzchar(df$task_code))
+  "task_code" %in% names(df) && any(!is.na(df$task_code) & nzchar(df$task_code))
 }
 
 #' Collapse each location to one record per gauging round
@@ -203,6 +203,21 @@ measure_label <- function(col) {
 measure_type <- function(col) {
   meta <- c(WATER_MEASURES, LNAPL_MEASURES)[[col]]
   if (is.null(meta)) "depth" else meta$type
+}
+
+#' Locations carrying at least one LNAPL observation
+#'
+#' A recorded thickness of zero is a gauged well with no product, so only a
+#' positive thickness counts as LNAPL. A depth or elevation is only ever
+#' recorded when product was found, so any value there counts.
+locations_with_lnapl <- function(df, measures = names(LNAPL_MEASURES)) {
+  measures <- intersect(measures, names(df))
+  hits <- lapply(measures, function(m) {
+    v <- df[[m]]
+    keep <- if (measure_type(m) == "thickness") !is.na(v) & v > 0 else !is.na(v)
+    df$location_code[keep]
+  })
+  sort(unique(unlist(hits, use.names = FALSE)))
 }
 
 #' Suggest a y-axis unit label from the measure type and the export's own unit
@@ -766,7 +781,7 @@ build_hydrograph <- function(df, opts) {
     colour_by,
     palette,
     reverse_y = reverse_water,
-    single_colour = WATER_COLOUR,
+    single_colour = opts$water_colour %||% WATER_COLOUR,
     facet = opts$facet,
     ncol = opts$ncol,
     free_y = opts$free_y,
@@ -818,7 +833,7 @@ build_hydrograph <- function(df, opts) {
     colour_by,
     palette,
     reverse_y = reverse_lnapl,
-    single_colour = LNAPL_COLOUR,
+    single_colour = opts$lnapl_colour %||% LNAPL_COLOUR,
     facet = FALSE,
     ncol = opts$ncol,
     free_y = opts$free_y,
@@ -885,7 +900,7 @@ build_location_grid <- function(df, opts, x_scale, palette, locations) {
       NULL,
       palette,
       reverse_y = reverse_water,
-      single_colour = WATER_COLOUR,
+      single_colour = opts$water_colour %||% WATER_COLOUR,
       # A one-location facet is only what draws the strip carrying the well
       # name, and a facet needs a row to work from - so on the rare well with
       # no water values the strip moves to the LNAPL panel below.
@@ -913,7 +928,7 @@ build_location_grid <- function(df, opts, x_scale, palette, locations) {
       NULL,
       palette,
       reverse_y = reverse_lnapl,
-      single_colour = LNAPL_COLOUR,
+      single_colour = opts$lnapl_colour %||% LNAPL_COLOUR,
       facet = !has_water,
       ncol = 1,
       free_y = FALSE,
@@ -1104,15 +1119,44 @@ ui <- page_sidebar(
           "an elevation plot. Off: depth increases upward, so a falling ",
           "water level plots as a rising line."
         ),
+        # One panel per location draws every trace in a single colour, so a
+        # colour is the user's to pick. Overlaid, the colours are the legend
+        # and come from the validated categorical palette instead.
+        conditionalPanel(
+          condition = "input.facet",
+          colourInput(
+            "water_colour",
+            "Water level colour",
+            value = WATER_COLOUR,
+            closeOnClick = TRUE
+          )
+        ),
         selectInput(
           "lnapl_measure",
           "LNAPL panel",
           choices = c("None" = "none")
         ),
         textInput("lnapl_unit_label", "LNAPL unit"),
+        conditionalPanel(
+          condition = "input.facet && input.lnapl_measure != 'none'",
+          colourInput(
+            "lnapl_colour",
+            "LNAPL colour",
+            value = LNAPL_COLOUR,
+            closeOnClick = TRUE
+          )
+        ),
         help_text(
           "Added as a shorter panel below, sharing the x-axis. Defaults to ",
           "thickness when the file carries it."
+        ),
+        conditionalPanel(
+          condition = "input.facet",
+          help_text(
+            "The two colours apply to every panel and carry through to the ",
+            "PNG, PDF and appendix exports. They are hidden when locations ",
+            "are overlaid on one panel, where colour identifies the well."
+          )
         )
       ),
 
@@ -1138,6 +1182,11 @@ ui <- page_sidebar(
             "Clear",
             class = "btn-sm btn-outline-secondary"
           ),
+          actionButton(
+            "select_lnapl",
+            "LNAPL only",
+            class = "btn-sm btn-outline-secondary"
+          ),
           conditionalPanel(
             condition = "input.pause_refresh",
             actionButton(
@@ -1146,6 +1195,11 @@ ui <- page_sidebar(
               class = "btn-sm btn-primary"
             )
           )
+        ),
+        help_text(
+          "LNAPL only replaces the selection with every location that has at ",
+          "least one LNAPL observation - a positive thickness, or any recorded ",
+          "LNAPL depth or elevation."
         ),
         checkboxInput("pause_refresh", "Pause refresh while selecting", FALSE),
         help_text(
@@ -1519,6 +1573,29 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "locations", selected = character(0))
   })
 
+  observeEvent(input$select_lnapl, {
+    df <- imported()
+    req(df)
+    locs <- locations_with_lnapl(df)
+    if (length(locs) == 0) {
+      showNotification(
+        "No location in this file has an LNAPL observation.",
+        type = "warning"
+      )
+      return()
+    }
+    updateSelectizeInput(session, "locations", selected = locs)
+    showNotification(
+      sprintf(
+        "Selected %d location%s with LNAPL.",
+        length(locs),
+        if (length(locs) == 1) "" else "s"
+      ),
+      type = "message",
+      duration = 4
+    )
+  })
+
   # --- location selection --------------------------------------------------
 
   # Redrawing on every keystroke of a selectize is fine for a handful of wells
@@ -1710,6 +1787,8 @@ server <- function(input, output, session) {
       unit_label = input$unit_label %||% "",
       lnapl_measure = input$lnapl_measure %||% "none",
       lnapl_unit_label = input$lnapl_unit_label %||% "",
+      water_colour = input$water_colour %||% WATER_COLOUR,
+      lnapl_colour = input$lnapl_colour %||% LNAPL_COLOUR,
       reverse_y = isTRUE(input$reverse_y),
       facet = isTRUE(input$facet),
       ncol = max(1, as.integer(input$ncol %||% 2)),
