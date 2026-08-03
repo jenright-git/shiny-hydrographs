@@ -1094,10 +1094,25 @@ ui <- page_sidebar(
       placeholder = "No file selected"
     ),
     help_text(
-      "An EQuIS 'Water Levels II' or esdat gauging report. Read with ",
-      tags$code("gRs::data_processor()"),
-      " - column names are matched ",
-      "automatically, and nothing is corrected or converted."
+      "Upload an EQuIS 'Water Levels II' or esdat gauging report. 
+      Filters should be applied on the database side prior to upload."
+    ),
+
+    # Redrawing is the one genuinely slow thing the app does, so the gate over
+    # it sits above the accordion rather than inside one panel: it holds every
+    # control below, not just the location list it started out as.
+    div(
+      class = "border rounded p-2 mb-3",
+      checkboxInput("auto_redraw", "Redraw plot automatically", TRUE),
+      conditionalPanel(
+        condition = "!input.auto_redraw",
+        actionButton(
+          "redraw",
+          "Redraw now",
+          class = "btn-primary btn-sm w-100 mb-2"
+        )
+      ),
+      uiOutput("redraw_note")
     ),
 
     accordion(
@@ -1154,8 +1169,7 @@ ui <- page_sidebar(
           condition = "input.facet",
           help_text(
             "The two colours apply to every panel and carry through to the ",
-            "PNG, PDF and appendix exports. They are hidden when locations ",
-            "are overlaid on one panel, where colour identifies the well."
+            "PNG, PDF and appendix exports. Single panel colours are applied by default."
           )
         )
       ),
@@ -1186,14 +1200,6 @@ ui <- page_sidebar(
             "select_lnapl",
             "LNAPL only",
             class = "btn-sm btn-outline-secondary"
-          ),
-          conditionalPanel(
-            condition = "input.pause_refresh",
-            actionButton(
-              "apply_locations",
-              "Apply",
-              class = "btn-sm btn-primary"
-            )
           )
         ),
         help_text(
@@ -1201,14 +1207,23 @@ ui <- page_sidebar(
           "least one LNAPL observation - a positive thickness, or any recorded ",
           "LNAPL depth or elevation."
         ),
-        checkboxInput("pause_refresh", "Pause refresh while selecting", FALSE),
-        help_text(
-          "Tick this before building up a selection: the plot holds its ",
-          "current locations while you add or remove as many as you like, and ",
-          "redraws once when you press Apply. Every other control still ",
-          "refreshes immediately."
+        radioButtons(
+          "preview_scope",
+          "Preview",
+          choices = c(
+            "First appendix page only" = "page",
+            "Every selected location" = "all"
+          ),
+          selected = "page"
         ),
-        uiOutput("pending_note"),
+        help_text(
+          "Preview only the first page of the set appendix layout. ",
+          "Use when a large number of wells are being exported to prevent plot",
+          "from regenerating and slowing down. The appendix still ",
+          "covers every location selected. PNG and PDF export exactly what is ",
+          "previewed."
+        ),
+        uiOutput("preview_note"),
         checkboxInput("facet", "One panel per location", TRUE),
         numericInput(
           "ncol",
@@ -1239,11 +1254,11 @@ ui <- page_sidebar(
         dateRangeInput("date_range", "Date range", start = NULL, end = NULL),
         selectInput("avg_time", "Average by", choices = AVG_TIME_CHOICES),
         help_text(
-          "Periods are averaged with ",
-          tags$code("openair::timeAverage()"),
-          ", each location independently. 'Gauging round' groups on ",
-          tags$code("task_code"),
-          " instead and appears once the file carries one. Dry flags and ",
+          "Periods are averaged for
+          ",
+          "each location independently. 'Gauging round' groups on ",
+          tags$code("task_code (monitoring round)"),
+          " instead and appears when present in the data. Dry flags and ",
           "screen bands are hidden whenever anything is averaged."
         ),
         conditionalPanel(
@@ -1374,10 +1389,25 @@ ui <- page_sidebar(
           "y-axis is selected."
         ),
         uiOutput("appendix_note"),
-        downloadButton(
-          "download_appendix",
-          "Multi-page PDF",
-          class = "btn-primary btn-sm"
+        div(
+          class = "d-flex gap-2 mb-2",
+          actionButton(
+            "build_appendix",
+            "Build",
+            class = "btn-primary btn-sm"
+          ),
+          downloadButton(
+            "download_appendix",
+            "Download PDF",
+            class = "btn-outline-primary btn-sm"
+          )
+        ),
+        help_text(
+          "Build renders every page once, with a progress bar, and holds the ",
+          "PDF. Download then serves that file, so downloading it again - or ",
+          "changing anything the appendix does not depend on - costs nothing. ",
+          "Change something it does depend on and the note above says so; ",
+          "downloading while stale rebuilds first."
         )
       )
     )
@@ -1425,16 +1455,28 @@ ui <- page_sidebar(
 server <- function(input, output, session) {
   imported <- reactiveVal(NULL)
 
+  # Identifies the loaded file for the plot cache and the appendix staleness
+  # check. Two exports can share a name and a row count, so the load time is
+  # what actually makes it unique.
+  data_token <- reactiveVal(NULL)
+
   observeEvent(input$data_file, {
     res <- import_gauging(input$data_file$datapath, input$data_file$name)
 
     if (!is.null(res$error)) {
       imported(NULL)
+      data_token(NULL)
       showNotification(res$error, type = "error", duration = NULL)
       return()
     }
 
     imported(res$data)
+    data_token(paste(
+      input$data_file$name,
+      nrow(res$data),
+      as.numeric(Sys.time()),
+      sep = "|"
+    ))
     showNotification(
       sprintf(
         "Loaded %s records from %s locations.",
@@ -1598,54 +1640,11 @@ server <- function(input, output, session) {
 
   # --- location selection --------------------------------------------------
 
-  # Redrawing on every keystroke of a selectize is fine for a handful of wells
-  # and painful for thirty, so the plot reads a committed copy of the selection
-  # rather than the widget. Unpaused the copy tracks the widget; paused it only
-  # moves on Apply, which is also what unpausing does.
-  locations_active <- reactiveVal(character(0))
-
-  observeEvent(list(input$locations, input$pause_refresh), {
-    if (isTRUE(input$pause_refresh)) {
-      return()
-    }
-    locations_active(input$locations %||% character(0))
-  })
-
-  observeEvent(input$apply_locations, {
-    locations_active(input$locations %||% character(0))
-  })
-
-  # Paused, the sidebar is the only thing that shows a pending edit - the plot
-  # deliberately does not.
-  output$pending_note <- renderUI({
-    req(isTRUE(input$pause_refresh))
-    pending <- input$locations %||% character(0)
-    active <- locations_active()
-    added <- setdiff(pending, active)
-    removed <- setdiff(active, pending)
-
-    if (length(added) == 0 && length(removed) == 0) {
-      return(help_text(sprintf(
-        "Paused. Plot is showing all %d selected location%s.",
-        length(active),
-        if (length(active) == 1) "" else "s"
-      )))
-    }
-    div(
-      class = "form-text text-primary fw-semibold",
-      style = "margin-top:-0.4rem;margin-bottom:0.6rem;",
-      sprintf(
-        "%s not plotted yet - press Apply.",
-        paste(
-          c(
-            if (length(added) > 0) paste(length(added), "added"),
-            if (length(removed) > 0) paste(length(removed), "removed")
-          ),
-          collapse = ", "
-        )
-      )
-    )
-  })
+  # The selection now tracks the widget directly: holding a redraw back while
+  # a selection is built up is the global redraw gate's job, and the data
+  # pipeline below is cheap next to a render. That keeps the data tab and the
+  # appendix reading the selection actually on screen.
+  locations_active <- reactive(input$locations %||% character(0))
 
   # --- data pipeline -------------------------------------------------------
 
@@ -1805,17 +1804,141 @@ server <- function(input, output, session) {
     )
   })
 
-  hydrograph <- reactive({
+  # --- what the preview draws ----------------------------------------------
+
+  # Drawing every selected well into a 180 mm figure is the slowest thing the
+  # app does, and at that size forty panels are unreadable anyway. The preview
+  # therefore shows one appendix page unless asked otherwise; the appendix
+  # itself still covers the whole selection.
+  preview_locations <- reactive({
+    locs <- locations_active()
+    if (identical(input$preview_scope %||% "page", "all")) {
+      return(locs)
+    }
+    pages <- paginate(locs, per_page())
+    if (length(pages) == 0) character(0) else pages[[1]]
+  })
+
+  # Subset after averaging rather than before: every averaging mode groups by
+  # location, so each well's values are the same either way, and taking the
+  # preview from the frame the appendix uses guarantees it *is* appendix page 1.
+  preview_df <- reactive({
     df <- averaged()
-    opts <- plot_opts()
+    df[df$location_code %in% preview_locations(), , drop = FALSE]
+  })
+
+  output$preview_note <- renderUI({
+    total <- length(locations_active())
+    if (total == 0) {
+      return(help_text("Select locations to draw a hydrograph."))
+    }
+    shown <- length(preview_locations())
+    if (shown >= total) {
+      return(help_text(sprintf(
+        "Previewing all %d selected location%s.",
+        total,
+        if (total == 1) "" else "s"
+      )))
+    }
+    help_text(sprintf(
+      "Previewing %d of %d selected locations - appendix page 1 of %d.",
+      shown,
+      total,
+      length(paginate(locations_active(), per_page()))
+    ))
+  })
+
+  # --- redraw gate ---------------------------------------------------------
+
+  # Everything the drawn figure depends on, in one small comparable object.
+  # Cheap enough to recompute on every input change, so it can both tell the
+  # user the figure is out of date and serve as the plot cache key.
+  plot_signature <- reactive({
+    list(
+      data = data_token(),
+      locations = preview_locations(),
+      date_range = as.character(input$date_range),
+      avg_time = input$avg_time %||% "none",
+      avg_statistic = input$avg_statistic %||% "mean",
+      avg_percentile = avg_percentile(),
+      opts = plot_opts()
+    )
+  })
+
+  # The committed snapshot the preview actually draws. Holding the data and
+  # options alongside the signature - rather than re-reading them at render
+  # time - is what keeps the cache key an honest description of the image.
+  committed <- reactiveVal(NULL)
+
+  snapshot <- function() {
+    list(
+      sig = plot_signature(),
+      # req() upstream throws when nothing is selected yet; the resulting NULL
+      # is handled by the validate() below rather than freezing a stale figure.
+      df = tryCatch(preview_df(), error = function(e) NULL),
+      opts = plot_opts()
+    )
+  }
+
+  # Debounced at the commit rather than on each control, which is the level
+  # that actually matters: a burst of events - a caption typed character by
+  # character, a colour wheel dragged, or a measure change that also rewrites
+  # the unit box behind it - collapses into one redraw instead of one per
+  # event. Debouncing the individual boxes could not do that, and left the
+  # programmatic unit update trailing the measure it belongs to by a render.
+  #
+  # The signature is cheap to recompute, so only it is debounced; the data is
+  # gathered once, at the commit, by the isolated snapshot below.
+  redraw_trigger <- debounce(plot_signature, 400)
+
+  observe({
+    redraw_trigger()
+    req(isTRUE(input$auto_redraw))
+    committed(isolate(snapshot()))
+  })
+
+  # The button skips the debounce - it is already an explicit "now".
+  observeEvent(input$redraw, {
+    committed(snapshot())
+  })
+
+  plot_is_stale <- reactive({
+    !identical(committed()$sig, plot_signature())
+  })
+
+  output$redraw_note <- renderUI({
+    if (isTRUE(input$auto_redraw)) {
+      return(help_text(
+        "Untick this before building up a ",
+        "big selection, or while trying settings on a slow figure."
+      ))
+    }
+    if (!plot_is_stale()) {
+      return(help_text("Paused. The plot matches the current settings."))
+    }
+    div(
+      class = "form-text text-primary fw-semibold",
+      style = "margin-top:-0.4rem;margin-bottom:0.6rem;",
+      "Settings have changed - press Redraw now to update the plot."
+    )
+  })
+
+  hydrograph <- reactive({
+    state <- committed()
+    # A snapshot can be taken before the measure dropdown has been filled from
+    # a new file, and validate() evaluates every need() rather than stopping at
+    # the first - so the measure has to be real before any of them run.
+    req(state, state$opts$measure)
+    df <- state$df
+    opts <- state$opts
 
     validate(
       need(
-        nrow(df) > 0,
+        !is.null(df) && nrow(df) > 0,
         "No records match the current location and date selections."
       ),
       need(
-        any(!is.na(df[[opts$measure]])),
+        !is.null(df) && any(!is.na(df[[opts$measure]])),
         paste0(
           "No ",
           tolower(measure_label(opts$measure)),
@@ -1857,16 +1980,33 @@ server <- function(input, output, session) {
     )
   })
 
-  output$hydrograph <- renderPlot(
+  # Cached on the committed signature, so flipping a setting and flipping it
+  # back - the bulk of what an edit session actually is - serves the stored
+  # image instead of redrawing. The cache stores the rendered PNG rather than
+  # the ggplot object, which is the half of the work that is expensive.
+  #
+  # Session-scoped deliberately: an app-wide cache would be shared across
+  # everyone connected, and figure-sized images add up faster than a
+  # memory-constrained Connect Cloud instance can afford.
+  output$hydrograph <- renderCachedPlot(
     hydrograph(),
+    # renderCachedPlot() caches errors under the same key, so a validation
+    # message needs a key that describes it too - which this already does.
+    # Wrapped in a list so the key stays valid before anything is committed.
+    cacheKeyExpr = list(committed()$sig),
+    # The default policy rounds the plot up to quantised dimensions, which
+    # would break the promise that the preview is the export at its true size.
+    # The size here is fixed by the width and height boxes rather than by the
+    # browser, so exact dimensions still give stable cache keys.
+    sizePolicy = function(dims) dims,
     res = 96,
+    cache = "session",
     bg = INK$surface
   )
 
   # --- exports -------------------------------------------------------------
 
-  export_stem <- reactive({
-    locs <- locations_active()
+  export_stem <- function(locs) {
     tag <- if (length(locs) == 1) locs else paste0(length(locs), "-locations")
     paste0(
       "hydrograph_",
@@ -1874,7 +2014,7 @@ server <- function(input, output, session) {
       "_",
       format(Sys.Date(), "%Y%m%d")
     )
-  })
+  }
 
   save_figure <- function(file, device) {
     ggsave(
@@ -1889,13 +2029,16 @@ server <- function(input, output, session) {
     )
   }
 
+  # Exports the committed figure, which is exactly the one on screen - so with
+  # the redraw gate paused these save what is previewed, not what the sidebar
+  # has been changed to since.
   output$download_png <- downloadHandler(
-    filename = function() paste0(export_stem(), ".png"),
+    filename = function() paste0(export_stem(preview_locations()), ".png"),
     content = function(file) save_figure(file, ragg::agg_png)
   )
 
   output$download_pdf <- downloadHandler(
-    filename = function() paste0(export_stem(), ".pdf"),
+    filename = function() paste0(export_stem(preview_locations()), ".pdf"),
     content = function(file) save_figure(file, grDevices::cairo_pdf)
   )
 
@@ -1942,13 +2085,169 @@ server <- function(input, output, session) {
     paginate(locations_active(), per_page())
   })
 
+  # Everything the built PDF depends on. `facet` is dropped because an appendix
+  # is one well per panel whatever the screen shows, so toggling it on the
+  # preview must not mark a perfectly good PDF stale.
+  appendix_signature <- reactive({
+    opts <- plot_opts()
+    opts$facet <- NULL
+    list(
+      data = data_token(),
+      locations = sort(locations_active()),
+      per_page = per_page(),
+      width = num_or(input$fig_width, 277),
+      height = num_or(input$fig_height, 190),
+      date_range = as.character(input$date_range),
+      avg_time = input$avg_time %||% "none",
+      avg_statistic = input$avg_statistic %||% "mean",
+      avg_percentile = avg_percentile(),
+      opts = opts
+    )
+  })
+
+  # list(path, signature) for the PDF currently held on disk.
+  appendix_pdf <- reactiveVal(NULL)
+
+  #' Render every page to a temp PDF and remember it
+  #'
+  #' Deliberately not run inside the download handler. A download is a plain
+  #' HTTP GET, so building there holds the request open with no bytes flowing
+  #' for as long as the render takes - which is how a long appendix meets a
+  #' proxy timeout on a hosted deployment - and it throws the work away on
+  #' every repeat download. Built here, the GET only has to copy a file.
+  #'
+  #' @returns the path, or NULL when there is nothing to draw.
+  build_appendix <- function(signature) {
+    df <- averaged()
+    pages <- appendix_pages()
+    if (nrow(df) == 0 || length(pages) == 0) {
+      return(NULL)
+    }
+
+    opts <- plot_opts()
+    # An appendix is one well per panel by definition, whatever the screen is
+    # currently showing.
+    opts$facet <- TRUE
+    # Every page is laid out on the same grid, so a half-full last page leaves
+    # white space rather than stretching its wells.
+    opts$page_grid <- c(opts$ncol, ceiling(per_page() / opts$ncol))
+    # Measured over the whole selection, so page 3 is readable against page 1
+    # instead of each page rescaling to its own four wells.
+    limits <- plot_limits(df, opts)
+    opts$x_limits <- limits$x
+    opts$y_limits <- limits$y
+    opts$lnapl_limits <- limits$lnapl
+
+    path <- tempfile(pattern = "appendix_", fileext = ".pdf")
+    grDevices::cairo_pdf(
+      path,
+      width = num_or(input$fig_width, 277) / 25.4,
+      height = num_or(input$fig_height, 190) / 25.4,
+      onefile = TRUE,
+      bg = INK$surface
+    )
+    # A page that fails part way through leaves a truncated PDF, which is worse
+    # than none at all - the device is always closed, and the file only kept if
+    # every page was drawn.
+    complete <- FALSE
+    on.exit(
+      {
+        grDevices::dev.off()
+        if (!complete) {
+          unlink(path)
+        }
+      },
+      add = TRUE
+    )
+
+    withProgress(message = "Building appendix", value = 0, {
+      for (i in seq_along(pages)) {
+        incProgress(
+          1 / length(pages),
+          detail = sprintf("page %d of %d", i, length(pages))
+        )
+        page_df <- df[df$location_code %in% pages[[i]], , drop = FALSE]
+        # A page whose wells hold no values for this measure would otherwise
+        # abort the whole export.
+        if (!any(!is.na(page_df[[opts$measure]]))) {
+          next
+        }
+        print(build_hydrograph(page_df, opts))
+      }
+    })
+
+    complete <- TRUE
+    appendix_pdf(list(path = path, signature = signature))
+    path
+  }
+
+  # "none" / "stale" / "ready". A hosted container can recycle between building
+  # and downloading, so a remembered path is only good while the file is still
+  # there - which is what makes the download handler's rebuild necessary rather
+  # than merely defensive.
+  #
+  # Deliberately a plain function and not a reactive: nothing invalidates a
+  # reactive when a file disappears from disk, so a cached "ready" would
+  # outlive the PDF it describes and the download would serve a missing path.
+  # Called inside renderUI it still takes the reactive dependencies it reads,
+  # and it re-checks the disk on every call.
+  appendix_state <- function() {
+    built <- appendix_pdf()
+    if (is.null(built) || !file.exists(built$path)) {
+      return("none")
+    }
+    if (!identical(built$signature, appendix_signature())) {
+      return("stale")
+    }
+    "ready"
+  }
+
+  observeEvent(input$build_appendix, {
+    res <- tryCatch(
+      build_appendix(appendix_signature()),
+      error = function(e) e
+    )
+    if (inherits(res, "error")) {
+      # A req() upstream aborts with no message of its own, which would leave
+      # the notification trailing off after the colon.
+      msg <- conditionMessage(res)
+      showNotification(
+        if (nzchar(msg)) {
+          paste0("Appendix build failed: ", msg)
+        } else {
+          "Appendix build failed - check the measure and location selections."
+        },
+        type = "error",
+        duration = NULL
+      )
+      return()
+    }
+    if (is.null(res)) {
+      showNotification(
+        "Nothing to build - select locations with values first.",
+        type = "warning"
+      )
+      return()
+    }
+    n <- length(appendix_pages())
+    showNotification(
+      sprintf(
+        "Appendix built - %d page%s ready to download.",
+        n,
+        if (n == 1) "" else "s"
+      ),
+      type = "message",
+      duration = 5
+    )
+  })
+
   output$appendix_note <- renderUI({
     pages <- appendix_pages()
     n_loc <- length(locations_active())
     if (n_loc == 0) {
       return(help_text("Select locations to build an appendix."))
     }
-    help_text(sprintf(
+    size <- sprintf(
       "%d location%s over %d page%s at %g x %g mm.",
       n_loc,
       if (n_loc == 1) "" else "s",
@@ -1956,54 +2255,45 @@ server <- function(input, output, session) {
       if (length(pages) == 1) "" else "s",
       num_or(input$fig_width, 0),
       num_or(input$fig_height, 0)
-    ))
+    )
+    switch(
+      appendix_state(),
+      ready = div(
+        class = "form-text text-success fw-semibold",
+        style = "margin-top:-0.4rem;margin-bottom:0.6rem;",
+        paste(size, "Built and ready to download.")
+      ),
+      stale = div(
+        class = "form-text text-primary fw-semibold",
+        style = "margin-top:-0.4rem;margin-bottom:0.6rem;",
+        paste(
+          size,
+          "Settings have changed since it was built - press Build again, or",
+          "download to rebuild first."
+        )
+      ),
+      help_text(paste(size, "Press Build to render it."))
+    )
   })
 
   output$download_appendix <- downloadHandler(
-    filename = function() paste0(export_stem(), "_appendix.pdf"),
+    filename = function() {
+      paste0(export_stem(locations_active()), "_appendix.pdf")
+    },
     content = function(file) {
-      df <- averaged()
-      pages <- appendix_pages()
-      req(nrow(df) > 0, length(pages) > 0)
-
-      opts <- plot_opts()
-      # An appendix is one well per panel by definition, whatever the screen
-      # is currently showing.
-      opts$facet <- TRUE
-      # Every page is laid out on the same grid, so a half-full last page
-      # leaves white space rather than stretching its wells.
-      opts$page_grid <- c(opts$ncol, ceiling(per_page() / opts$ncol))
-      # Measured over the whole selection, so page 3 is readable against
-      # page 1 instead of each page rescaling to its own four wells.
-      limits <- plot_limits(df, opts)
-      opts$x_limits <- limits$x
-      opts$y_limits <- limits$y
-      opts$lnapl_limits <- limits$lnapl
-
-      grDevices::cairo_pdf(
-        file,
-        width = num_or(input$fig_width, 277) / 25.4,
-        height = num_or(input$fig_height, 190) / 25.4,
-        onefile = TRUE,
-        bg = INK$surface
-      )
-      on.exit(grDevices::dev.off(), add = TRUE)
-
-      withProgress(message = "Building appendix", value = 0, {
-        for (i in seq_along(pages)) {
-          incProgress(
-            1 / length(pages),
-            detail = sprintf("page %d of %d", i, length(pages))
-          )
-          page_df <- df[df$location_code %in% pages[[i]], , drop = FALSE]
-          # A page whose wells hold no values for this measure would other-
-          # wise abort the whole export.
-          if (!any(!is.na(page_df[[opts$measure]]))) {
-            next
-          }
-          print(build_hydrograph(page_df, opts))
-        }
-      })
+      built <- appendix_pdf()
+      path <- if (identical(appendix_state(), "ready")) {
+        built$path
+      } else {
+        build_appendix(appendix_signature())
+      }
+      # Serving a path that has since gone would hand the browser an empty
+      # file, so a failed copy rebuilds once rather than reporting success.
+      if (is.null(path) || !file.copy(path, file, overwrite = TRUE)) {
+        path <- build_appendix(appendix_signature())
+        req(!is.null(path))
+        file.copy(path, file, overwrite = TRUE)
+      }
     }
   )
 
@@ -2100,7 +2390,9 @@ server <- function(input, output, session) {
   })
 
   output$download_xlsx <- downloadHandler(
-    filename = function() paste0(export_stem(), "_data.xlsx"),
+    filename = function() {
+      paste0(export_stem(locations_active()), "_data.xlsx")
+    },
     content = function(file) {
       df <- table_data()
       req(nrow(df) > 0)

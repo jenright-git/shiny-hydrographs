@@ -70,7 +70,7 @@ image — PNG or a collated PDF document.
 
 ## UI
 
-No set layout. Aim to keep it as simple and user friendly as possible.
+No set layout. Aim to keep it simple and user friendly but also a modern style and look.
 
 - Seagreen colour theme for components.
 - Helper text always welcome.
